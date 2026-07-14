@@ -5,20 +5,29 @@ import re
 app = FastAPI()
 
 VALID_EVENTS = ["order.created"]
-VALID_STATUS = ["paid","pending","refunded"]
+VALID_STATUS = ["paid", "pending", "refunded"]
 
 EMAIL_REGEX = r'^[^@]+@[^@]+\.[^@]+$'
+
+PRODUCT_CACHE = {}
+FX_CACHE = None
 
 
 @app.get("/")
 def health():
-    return {"status":"ok"}
+    return {
+        "status": "ok"
+    }
 
 
 @app.post("/process")
 def process(order: dict):
 
     errors = []
+
+    # =====================
+    # Basic Validation
+    # =====================
 
     if order.get("event") not in VALID_EVENTS:
         errors.append("invalid event")
@@ -33,24 +42,31 @@ def process(order: dict):
         EMAIL_REGEX,
         order["customer_email"]
     ):
-        errors.append("invalid email")
+        errors.append("invalid customer_email")
 
     if order.get("status") not in VALID_STATUS:
         errors.append("invalid status")
 
-    enriched_lines = []
+    if not order.get("currency"):
+        errors.append("missing currency")
 
+    enriched_lines = []
     revenue_original = 0
 
-    for line in order.get("lines",[]):
+    # =====================
+    # Product Enrichment
+    # =====================
+
+    for line in order.get("lines", []):
 
         pid = line.get("product_id")
-
         qty = line.get("quantity")
+        unit_price = line.get("unit_price")
 
-        if not isinstance(qty,int):
+        # product_id validation
+        if not isinstance(pid, int):
             errors.append(
-                f"invalid quantity for product {pid}"
+                f"invalid product_id {pid}"
             )
             continue
 
@@ -60,23 +76,54 @@ def process(order: dict):
             )
             continue
 
-        catalog = requests.get(
-            f"https://dummyjson.com/products/{pid}",
-            timeout=10
-        )
-
-        if catalog.status_code != 200:
+        # quantity validation
+        if not isinstance(qty, int):
             errors.append(
-                f"catalog lookup failed for {pid}"
+                f"invalid quantity for product {pid}"
             )
             continue
 
-        product = catalog.json()
+        if qty <= 0:
+            errors.append(
+                f"quantity must be > 0 for product {pid}"
+            )
+            continue
 
-        subtotal = qty * float(
-            line["unit_price"]
-        )
+        # unit_price validation
+        try:
+            unit_price = float(unit_price)
+        except:
+            errors.append(
+                f"invalid unit_price for product {pid}"
+            )
+            continue
 
+        # Product cache
+        if pid not in PRODUCT_CACHE:
+
+            try:
+                catalog_response = requests.get(
+                    f"https://dummyjson.com/products/{pid}",
+                    timeout=10
+                )
+
+                if catalog_response.status_code != 200:
+                    errors.append(
+                        f"catalog lookup failed for {pid}"
+                    )
+                    continue
+
+                PRODUCT_CACHE[pid] = catalog_response.json()
+
+            except Exception:
+                errors.append(
+                    f"catalog service unavailable for {pid}"
+                )
+                continue
+
+        product = PRODUCT_CACHE[pid]
+
+        subtotal = qty * unit_price
         revenue_original += subtotal
 
         enriched_lines.append({
@@ -88,35 +135,76 @@ def process(order: dict):
             "line_total": subtotal
         })
 
+    # Return rejected record
     if errors:
         return {
-            "valid":False,
-            "reasons":errors
+            "valid": False,
+            "reasons": errors
         }
 
-    currency = order["currency"]
+    # =====================
+    # FX Conversion
+    # =====================
 
-    fx = requests.get(
-        "https://api.frankfurter.dev/v1/latest?base=USD",
-        timeout=10
-    ).json()
+    global FX_CACHE
+
+    try:
+        if FX_CACHE is None:
+
+            fx_response = requests.get(
+                "https://api.frankfurter.dev/v1/latest?base=USD",
+                timeout=10
+            )
+
+            if fx_response.status_code != 200:
+                return {
+                    "valid": False,
+                    "reasons": [
+                        "fx service unavailable"
+                    ]
+                }
+
+            FX_CACHE = fx_response.json()
+
+        fx = FX_CACHE
+
+    except Exception:
+        return {
+            "valid": False,
+            "reasons": [
+                "fx service unavailable"
+            ]
+        }
+
+    currency = order.get("currency")
 
     if currency == "USD":
         fx_rate = 1
+
     elif currency in fx["rates"]:
         fx_rate = fx["rates"][currency]
+
     else:
-        raise Exception(f"Unsupported currency: {currency}")
+        return {
+            "valid": False,
+            "reasons": [
+                f"unsupported currency {currency}"
+            ]
+        }
 
     revenue_usd = revenue_original / fx_rate
 
+    # =====================
+    # Success Response
+    # =====================
+
     return {
-        "valid":True,
-        "order_id":order["order_id"],
-        "fx_rate_used":fx_rate,
-        "revenue_usd":round(
+        "valid": True,
+        "order_id": order["order_id"],
+        "fx_rate_used": fx_rate,
+        "revenue_usd": round(
             revenue_usd,
             2
         ),
-        "lines":enriched_lines
+        "lines": enriched_lines
     }
