@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 import requests
 import re
+from dateutil import parser
+from datetime import datetime, timedelta
 
 app = FastAPI()
 
@@ -13,6 +15,41 @@ PRODUCT_CACHE = {}
 FX_CACHE = None
 
 
+def normalize_date(date_value):
+
+    if not date_value:
+        return None
+
+    try:
+        # Excel serial date support
+        if str(date_value).isdigit():
+            excel_epoch = datetime(
+                1899,
+                12,
+                30
+            )
+
+            dt = excel_epoch + timedelta(
+                days=int(date_value)
+            )
+
+            return dt.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+        dt = parser.parse(
+            str(date_value),
+            dayfirst=False
+        )
+
+        return dt.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    except Exception:
+        return None
+
+
 @app.get("/")
 def health():
     return {
@@ -23,48 +60,94 @@ def health():
 @app.post("/process")
 def process(order: dict):
 
+    global FX_CACHE
+
     errors = []
 
-    # =====================
+    # ==========================
+    # Normalize placed_at
+    # ==========================
+
+    placed_at = normalize_date(
+        order.get("placed_at")
+    )
+
+    if not placed_at:
+        errors.append(
+            "invalid placed_at"
+        )
+
+    # ==========================
     # Basic Validation
-    # =====================
+    # ==========================
 
     if order.get("event") not in VALID_EVENTS:
-        errors.append("invalid event")
+        errors.append(
+            "invalid event"
+        )
 
     if not order.get("order_id"):
-        errors.append("missing order_id")
+        errors.append(
+            "missing order_id"
+        )
 
-    if not order.get("customer_email"):
-        errors.append("missing customer_email")
+    customer_email = order.get(
+        "customer_email"
+    )
+
+    if not customer_email:
+        errors.append(
+            "missing customer_email"
+        )
 
     elif not re.match(
         EMAIL_REGEX,
-        order["customer_email"]
+        customer_email
     ):
-        errors.append("invalid customer_email")
+        errors.append(
+            "invalid customer_email"
+        )
 
     if order.get("status") not in VALID_STATUS:
-        errors.append("invalid status")
+        errors.append(
+            "invalid status"
+        )
 
-    if not order.get("currency"):
-        errors.append("missing currency")
+    currency = order.get(
+        "currency"
+    )
+
+    if not currency:
+        errors.append(
+            "missing currency"
+        )
 
     enriched_lines = []
     revenue_original = 0
 
-    # =====================
+    # ==========================
     # Product Enrichment
-    # =====================
+    # ==========================
 
     for line in order.get("lines", []):
 
-        pid = line.get("product_id")
-        qty = line.get("quantity")
-        unit_price = line.get("unit_price")
+        pid = line.get(
+            "product_id"
+        )
 
-        # product_id validation
-        if not isinstance(pid, int):
+        qty = line.get(
+            "quantity"
+        )
+
+        unit_price = line.get(
+            "unit_price"
+        )
+
+        # product id
+        if not isinstance(
+            pid,
+            int
+        ):
             errors.append(
                 f"invalid product_id {pid}"
             )
@@ -76,8 +159,11 @@ def process(order: dict):
             )
             continue
 
-        # quantity validation
-        if not isinstance(qty, int):
+        # quantity
+        if not isinstance(
+            qty,
+            int
+        ):
             errors.append(
                 f"invalid quantity for product {pid}"
             )
@@ -89,16 +175,22 @@ def process(order: dict):
             )
             continue
 
-        # unit_price validation
+        # unit price
         try:
-            unit_price = float(unit_price)
-        except:
+            unit_price = float(
+                unit_price
+            )
+
+        except Exception:
             errors.append(
                 f"invalid unit_price for product {pid}"
             )
             continue
 
-        # Product cache
+        # =====================
+        # Product Cache
+        # =====================
+
         if pid not in PRODUCT_CACHE:
 
             try:
@@ -113,7 +205,9 @@ def process(order: dict):
                     )
                     continue
 
-                PRODUCT_CACHE[pid] = catalog_response.json()
+                PRODUCT_CACHE[pid] = (
+                    catalog_response.json()
+                )
 
             except Exception:
                 errors.append(
@@ -132,23 +226,32 @@ def process(order: dict):
             "category": product["category"],
             "catalog_price": product["price"],
             "quantity": qty,
-            "line_total": subtotal
+            "line_total": round(
+                subtotal,
+                2
+            )
         })
 
-    # Return rejected record
+    # ==========================
+    # Reject Record
+    # ==========================
+
     if errors:
         return {
             "valid": False,
+            "order_id": order.get(
+                "order_id",
+                "UNKNOWN"
+            ),
             "reasons": errors
         }
 
-    # =====================
-    # FX Conversion
-    # =====================
-
-    global FX_CACHE
+    # ==========================
+    # FX Rates
+    # ==========================
 
     try:
+
         if FX_CACHE is None:
 
             fx_response = requests.get(
@@ -159,48 +262,67 @@ def process(order: dict):
             if fx_response.status_code != 200:
                 return {
                     "valid": False,
+                    "order_id": order["order_id"],
                     "reasons": [
                         "fx service unavailable"
                     ]
                 }
 
-            FX_CACHE = fx_response.json()
+            FX_CACHE = (
+                fx_response.json()
+            )
 
         fx = FX_CACHE
 
     except Exception:
+
         return {
             "valid": False,
+            "order_id": order["order_id"],
             "reasons": [
                 "fx service unavailable"
             ]
         }
 
-    currency = order.get("currency")
+    # ==========================
+    # Currency Conversion
+    # ==========================
 
     if currency == "USD":
         fx_rate = 1
 
-    elif currency in fx["rates"]:
-        fx_rate = fx["rates"][currency]
+    elif currency in fx.get(
+        "rates",
+        {}
+    ):
+        fx_rate = fx["rates"][
+            currency
+        ]
 
     else:
         return {
             "valid": False,
+            "order_id": order["order_id"],
             "reasons": [
                 f"unsupported currency {currency}"
             ]
         }
 
-    revenue_usd = revenue_original / fx_rate
+    revenue_usd = (
+        revenue_original / fx_rate
+    )
 
-    # =====================
+    # ==========================
     # Success Response
-    # =====================
+    # ==========================
 
     return {
         "valid": True,
-        "order_id": order["order_id"],
+        "order_id": order[
+            "order_id"
+        ],
+        "placed_at": placed_at,
+        "currency": currency,
         "fx_rate_used": fx_rate,
         "revenue_usd": round(
             revenue_usd,
