@@ -103,8 +103,10 @@ def process(order: dict):
 
     if currency == "USD":
         fx_rate = 1
-    else:
+    elif currency in fx["rates"]:
         fx_rate = fx["rates"][currency]
+    else:
+        raise Exception(f"Unsupported currency: {currency}")
 
     revenue_usd = revenue_original / fx_rate
 
